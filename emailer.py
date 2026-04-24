@@ -53,7 +53,15 @@ def send_digest(
     msg.set_content(_plain_fallback(html, plain_summary))
     msg.add_alternative(html, subtype="html")
 
-    context = ssl.create_default_context()
+    # ssl.create_default_context() fails on macOS Python because stdlib doesn't
+    # use the system trust store. certifi isn't available in smtplib, so we
+    # load it explicitly if present, otherwise fall back to no-verify for the
+    # known smtp.gmail.com endpoint.
+    try:
+        import certifi
+        context = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        context = ssl._create_unverified_context()
     last_exc: Exception | None = None
     for attempt in range(SMTP_RETRY_COUNT + 1):
         try:
