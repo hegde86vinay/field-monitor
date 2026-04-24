@@ -43,8 +43,12 @@ def run(only_topic: Optional[str] = None) -> dict[str, list[Article]]:
             except Exception as exc:
                 log.error("tag=%s fetch failed: %s", tag, exc)
 
+        # Member-only articles rank above free ones; ties broken by recency.
         collected.sort(
-            key=lambda a: a.published_at or datetime.min.replace(tzinfo=timezone.utc),
+            key=lambda a: (
+                a.is_member_only,
+                a.published_at or datetime.min.replace(tzinfo=timezone.utc),
+            ),
             reverse=True,
         )
         results[topic] = collected[:TOP_N_PER_TOPIC]

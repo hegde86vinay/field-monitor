@@ -3,22 +3,30 @@
 Medium publishes https://medium.com/feed/tag/{slug} for every tag.
 These are public, unauthenticated, and not Cloudflare-protected.
 No Playwright required — just feedparser + beautifulsoup for snippet cleanup.
+
+Filters applied per article:
+  - English-only: langdetect on title + snippet (drops non-English articles)
+  - Member-only signal: detected from RSS content markers; used for ranking
 """
 
 from __future__ import annotations
 
 import logging
+import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import feedparser
 import requests
 from bs4 import BeautifulSoup
+from langdetect import DetectorFactory, LangDetectException, detect
 
 from config import MAX_TAG_DELAY_SEC, MIN_TAG_DELAY_SEC, WINDOW_HOURS
-import random
+
+# Make langdetect deterministic across runs
+DetectorFactory.seed = 0
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +49,7 @@ class Article:
     claps: int = 0
     published_at: Optional[datetime] = None
     source_tag: str = ""
+    is_member_only: bool = False
 
     def __hash__(self) -> int:
         return hash(self.url)
@@ -66,7 +75,6 @@ def _parse_published(entry: feedparser.FeedParserDict) -> Optional[datetime]:
 
 
 def _snippet(entry: feedparser.FeedParserDict) -> str:
-    # Prefer content over summary — Medium puts the lede in content[0]
     raw = ""
     if hasattr(entry, "content") and entry.content:
         raw = entry.content[0].get("value", "")
@@ -76,17 +84,50 @@ def _snippet(entry: feedparser.FeedParserDict) -> str:
     return text[:280] + "…" if len(text) > 280 else text
 
 
+def _is_english(title: str, snippet: str) -> bool:
+    """Return True if the article is detected as English.
+
+    Uses title + snippet together for a stronger signal. Treats detection
+    failures (text too short / ambiguous) as English to avoid false drops.
+    """
+    text = f"{title} {snippet}".strip()
+    if len(text) < 20:
+        return True  # too short to detect reliably — give benefit of the doubt
+    try:
+        return detect(text) == "en"
+    except LangDetectException:
+        return True
+
+
+def _is_member_only(entry: feedparser.FeedParserDict) -> bool:
+    """Detect Medium's member-only marker from RSS content.
+
+    Medium includes a lock-icon SVG and/or the text 'Member-only story'
+    in the content:encoded block of paywalled articles.
+    """
+    raw = ""
+    if hasattr(entry, "content") and entry.content:
+        raw = entry.content[0].get("value", "")
+    if not raw:
+        raw = getattr(entry, "summary", "")
+
+    lower = raw.lower()
+    return "member-only story" in lower or "member only story" in lower or 'aria-label="member' in lower
+
+
 def fetch_tag(tag: str) -> list[Article]:
-    """Fetch https://medium.com/feed/tag/{tag} and return articles within WINDOW_HOURS.
+    """Fetch https://medium.com/feed/tag/{tag} and return English articles within WINDOW_HOURS.
+
+    Applies:
+      - 24h recency filter
+      - English-only filter via langdetect
+      - member-only detection (stored on Article for ranking, not filtered out)
 
     Returns empty list on any error — caller logs and continues.
     """
     feed_url = f"https://medium.com/feed/tag/{tag}"
     log.info("rss fetch tag=%s", tag)
 
-    # Use requests so macOS Python gets certifi's cert bundle (stdlib urllib
-    # doesn't use the system trust store on macOS without /Applications/Python*/
-    # Install Certificates.command having been run).
     try:
         resp = requests.get(feed_url, headers=_HEADERS, timeout=20)
         resp.raise_for_status()
@@ -101,6 +142,7 @@ def fetch_tag(tag: str) -> list[Article]:
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=WINDOW_HOURS)
     articles: list[Article] = []
+    dropped_lang = 0
 
     for entry in feed.entries:
         published_at = _parse_published(entry)
@@ -114,6 +156,12 @@ def fetch_tag(tag: str) -> list[Article]:
         title = getattr(entry, "title", "").strip()
         author = getattr(entry, "author", "Unknown").strip()
         snippet = _snippet(entry)
+        member_only = _is_member_only(entry)
+
+        if not _is_english(title, snippet):
+            log.debug("tag=%s dropped non-English: %r", tag, title[:60])
+            dropped_lang += 1
+            continue
 
         articles.append(
             Article(
@@ -123,9 +171,17 @@ def fetch_tag(tag: str) -> list[Article]:
                 snippet=snippet,
                 published_at=published_at,
                 source_tag=tag,
+                is_member_only=member_only,
             )
         )
 
-    log.info("tag=%s entries=%d fresh=%d", tag, len(feed.entries), len(articles))
-    time.sleep(random.uniform(MIN_TAG_DELAY_SEC / 3, MAX_TAG_DELAY_SEC / 3))  # polite pacing
+    log.info(
+        "tag=%s entries=%d fresh=%d dropped_lang=%d member_only=%d",
+        tag,
+        len(feed.entries),
+        len(articles),
+        dropped_lang,
+        sum(1 for a in articles if a.is_member_only),
+    )
+    time.sleep(random.uniform(MIN_TAG_DELAY_SEC / 3, MAX_TAG_DELAY_SEC / 3))
     return articles
